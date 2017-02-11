@@ -1,0 +1,118 @@
+# Check required plugins
+REQUIRED_PLUGINS = %w(vagrant-triggers)
+exit unless REQUIRED_PLUGINS.all? { |plugin|
+  Vagrant.has_plugin?(plugin) || (
+    puts "The #{plugin} plugin is required. Please install it with:"
+    puts "vagrant plugin install #{plugin}"
+    false
+  )
+}
+
+Vagrant.configure(StackDockers::Vagrant::API_VERSION) do |config|
+
+    # Before up
+    config.trigger.before :up, :stdout => true do
+        # Run only for dockers
+        if @machine.provider.class.name === "VagrantPlugins::DockerProvider::Provider"
+
+            # If docker runs on vm
+            is_vm = @machine.provider.host_vm?
+
+            # Run only for the required docker
+            if StackDockers::Vagrant::Docker.snapshots.has_key?(@machine.provider_config.name.to_s)
+                StackDockers::Vagrant::Docker.snapshots[@machine.provider_config.name.to_s].each do |conf|
+
+                    # Create btrfs snapshot
+                    subvolume_mountpoint, docker_mountpoint = conf.split(':')
+                    snapshot_mountpoint = "#{subvolume_mountpoint}-#{@machine.provider_config.name}"
+                    unless File.directory?(snapshot_mountpoint)
+                        run StackDockers::Vagrant.create_command("sudo btrfs subvolume snapshot #{subvolume_mountpoint} #{snapshot_mountpoint}", is_vm)
+                    end
+                    
+                    # Mount it as volume in docker
+                    StackDockers::Vagrant::Docker.configure name: @machine.provider_config.name, volumes: ["#{snapshot_mountpoint}:#{docker_mountpoint}"]
+                end
+            end
+        end
+    end
+
+    # After up
+    config.trigger.after :up, :stdout => true do
+        # Run only for dockers
+        if @machine.provider.class.name === "VagrantPlugins::DockerProvider::Provider"
+
+            # If docker runs on vm
+            is_vm = @machine.provider.host_vm?
+            
+            # Run only for the required docker
+            if StackDockers::Vagrant::Docker.provisioners.has_key?(@machine.provider_config.name.to_s)
+                StackDockers::Vagrant::Docker.provisioners[@machine.provider_config.name.to_s].each do |script|
+                    # Run the script only if it has not been marked as ran before
+                    begin
+                        run StackDockers::Vagrant.create_command("docker exec -t #{@machine.provider_config.name} test -e /provisioners/#{script.gsub(/\s/,'_')}.lock", is_vm), :stdout => false
+                    rescue VagrantPlugins::Triggers::Errors::CommandFailed
+                        run StackDockers::Vagrant.create_command("docker exec -t #{@machine.provider_config.name} /provisioners/#{script}", is_vm)
+                        run StackDockers::Vagrant.create_command("docker exec -t #{@machine.provider_config.name} touch /provisioners/#{script.gsub(/\s/,'_')}.lock", is_vm), :stdout => false
+                    end
+                end
+            end
+        end
+    end
+
+    # After destroy
+    config.trigger.after :destroy, :stdout => true do
+        # Run only for dockers
+        if @machine.provider.class.name === "VagrantPlugins::DockerProvider::Provider"
+
+            # If docker runs on vm
+            is_vm = @machine.provider.host_vm?
+
+            # Remove docker (sometimes gets out of vagrant control)
+            run StackDockers::Vagrant.create_command("#{ENV['DOCKERS_PATH']}/scripts/wipe.sh #{@machine.provider_config.name.to_s}", is_vm)
+
+            if StackDockers::Vagrant::Docker.snapshots.has_key?(@machine.provider_config.name.to_s)
+                StackDockers::Vagrant::Docker.snapshots[@machine.provider_config.name.to_s].each do |conf|
+                    # Delete btrfs snapshot
+                    subvolume_mountpoint, docker_mountpoint = conf.split(':')
+                    snapshot_mountpoint = "#{subvolume_mountpoint}-#{@machine.provider_config.name}"
+                    if File.directory?(snapshot_mountpoint)
+                        run StackDockers::Vagrant.create_command("sudo btrfs subvolume delete #{snapshot_mountpoint}", is_vm)
+                    end
+                end
+            end
+        end
+    end        
+
+    # Create network container if used
+    if StackDockers::Vagrant::Docker.network
+        config.vm.define :"#{StackDockers::Vagrant::Docker.stack}#{StackDockers::Vagrant::Docker.namespace}" do |network|
+            network.vm.provider "docker" do |docker|
+                docker.image = "#{StackDockers::Vagrant::Docker.registry}/#{StackDockers::Vagrant::Docker.org}/ubuntu"
+                docker.name = :"#{StackDockers::Vagrant::Docker.stack}#{StackDockers::Vagrant::Docker.namespace}"
+                docker.vagrant_machine = StackDockers::Vagrant::DOCKER_VM
+                docker.vagrant_vagrantfile = "#{ENV['DOCKERS_PATH']}/vm/#{docker.vagrant_machine}/Vagrantfile"
+                docker.create_args = ["-h", docker.name.to_s]
+                if StackDockers::Vagrant::Docker.namespace.empty?
+                    docker.ports = StackDockers::Vagrant::Docker.ports
+                end
+                docker.force_host_vm = StackDockers::Vagrant::Docker.force_vm
+                docker.cmd = ["/bin/sh", "-c", "while true; do sleep 600; done"]
+            end
+    	end
+    end
+
+    # Create all configured dockers
+    StackDockers::Vagrant::Docker.dockers.each do |name, params|
+        config.vm.define :"#{StackDockers::Vagrant::Docker.stack}-#{name}#{StackDockers::Vagrant::Docker.namespace}" do |container|
+            container.vm.provider :docker do |docker|
+                docker.name = :"#{StackDockers::Vagrant::Docker.stack}-#{name}#{StackDockers::Vagrant::Docker.namespace}"
+                docker.image = "#{StackDockers::Vagrant::Docker.registry}/#{params['image']}"
+                docker.cmd = params['cmd'] if params.has_key?('cmd')
+                docker.vagrant_machine = StackDockers::Vagrant::DOCKER_VM
+                docker.vagrant_vagrantfile = "#{ENV['DOCKERS_PATH']}/vm/#{docker.vagrant_machine}/Vagrantfile"
+                docker.force_host_vm = StackDockers::Vagrant::Docker.force_vm
+                StackDockers::Vagrant::Docker.runtime(docker)
+            end
+        end
+    end
+end
