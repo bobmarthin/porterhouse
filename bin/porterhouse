@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+
+$LOAD_PATH.unshift("#{File.dirname(__FILE__)}/../lib")
+require 'porterhouse/cli'
+require 'porterhouse/stack'
+
+$stdout.sync = true
+params = Porterhouse::Cli.parse(ARGV)
+Porterhouse::Stack.new(params).run
